@@ -147,7 +147,8 @@ impl Addr {
                 3 => {
                     let size = buf.get(1).map(|l| -> usize { *l as usize });
                     if let Some(size) = size {
-                        let port = (buf[1 + size] as u16) << 8 | (buf[2 + size] as u16);
+                        trace!("buf:[2+size]: {}, buf:[3+size]: {}", buf[2+size], buf[3+size]);
+                        let port = (buf[2 + size] as u16) << 8 | (buf[3 + size] as u16);
                         Some(Self::DomainName(Vec::from(&buf[2..(2 + size)]), port))
                     } else {
                         None

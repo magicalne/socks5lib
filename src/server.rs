@@ -232,6 +232,7 @@ where
             if let Err(err) = ready!(Pin::new(io_src).poll_read(cx, &mut read_buf)) {
                 return Poll::Ready(Err(Error::IoError(err)));
             }
+            trace!("io src: poll read: {:?}", &read_buf.filled());
         }
 
         if let Err(err) = ready!(Pin::new(&mut io_dst).poll_write(cx, read_buf.filled())) {
@@ -240,6 +241,7 @@ where
         if let Err(err) = ready!(Pin::new(&mut io_dst).poll_flush(cx)) {
             return Poll::Ready(Err(Error::IoError(err)));
         }
+        trace!("io dst: poll write: {:?}", &read_buf.filled());
         read_buf.clear();
         Poll::Ready(Ok(()))
     }
@@ -253,6 +255,7 @@ where
             if let Err(err) = ready!(Pin::new(io_src).poll_read(cx, &mut read_buf)) {
                 return Poll::Ready(Err(Error::IoError(err)));
             }
+            trace!("io dst: poll read: {:?}", &read_buf.filled());
         }
 
         if let Err(err) = ready!(Pin::new(&mut io_dst).poll_write(cx, read_buf.filled())) {
@@ -261,6 +264,7 @@ where
         if let Err(err) = ready!(Pin::new(&mut io_dst).poll_flush(cx)) {
             return Poll::Ready(Err(Error::IoError(err)));
         }
+        trace!("io src: poll write: {:?}", &read_buf.filled());
         read_buf.clear();
         Poll::Ready(Ok(()))
     }
