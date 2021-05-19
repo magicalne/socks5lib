@@ -113,15 +113,19 @@ where
                     let _ = ready!(self.poll_remote(cx))?;
                 }
                 State::Connected => {
-                    let p1 = self.poll_connected(cx);
-                    let p2 = self.poll_connected2(cx);
-                    match (p1, p2) {
-                        (Poll::Ready(Err(err)), _) | (_, Poll::Ready(Err(err))) => {
-                            return Poll::Ready(Err(err))
-                        }
-                        (Poll::Pending, _) | (_, Poll::Pending) => return Poll::Pending,
-                        (_, _) => {}
+                    match ready!(self.poll_connected(cx)) {
+                        Ok(_) => {}
+                        Err(err) => return Poll::Ready(Err(err)),
                     }
+                    // let p1 = self.poll_connected(cx);
+                    // let p2 = self.poll_connected2(cx);
+                    // match (p1, p2) {
+                    //     (Poll::Ready(Err(err)), _) | (_, Poll::Ready(Err(err))) => {
+                    //         return Poll::Ready(Err(err))
+                    //     }
+                    //     (Poll::Pending, _) | (_, Poll::Pending) => return Poll::Pending,
+                    //     (_, _) => {}
+                    // }
                 }
             }
         }
@@ -223,50 +227,23 @@ where
     }
 
     fn poll_connected(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
-        let mut read_buf = to_read_buf(&mut self.read_buf);
         let me = &mut *self;
+        let mut read_buf = to_read_buf(&mut me.read_buf);
+        let mut write_buf = to_read_buf(&mut me.write_buf);
+
         let io_src = &mut me.io;
-        let mut io_dst = me.remote.as_mut().unwrap();
+        let io_dst = me.remote.as_mut().unwrap();
 
-        if read_buf.filled().is_empty() {
-            if let Err(err) = ready!(Pin::new(io_src).poll_read(cx, &mut read_buf)) {
-                return Poll::Ready(Err(Error::IoError(err)));
-            }
-            trace!("io src: poll read: {:?}", &read_buf.filled());
+        let mut src_proxy = Proxy::new(io_src, io_dst);
+        let p1 = src_proxy.poll_proxy(&mut read_buf, cx);
+        let mut dst_proxy = Proxy::new(io_dst, io_src);
+        let p2 = dst_proxy.poll_proxy(&mut write_buf, cx);
+        trace!("p1: {:?}, p2: {:?}", &p1, &p2);
+        match (p1, p2) {
+            (Poll::Ready(Err(err)), _) | (_, Poll::Ready(Err(err))) => Poll::Ready(Err(err)),
+            (Poll::Pending, _) | (_, Poll::Pending) => Poll::Pending,
+            (_, _) => Poll::Ready(Ok(())),
         }
-
-        if let Err(err) = ready!(Pin::new(&mut io_dst).poll_write(cx, read_buf.filled())) {
-            return Poll::Ready(Err(Error::IoError(err)));
-        }
-        if let Err(err) = ready!(Pin::new(&mut io_dst).poll_flush(cx)) {
-            return Poll::Ready(Err(Error::IoError(err)));
-        }
-        trace!("io dst: poll write: {:?}", &read_buf.filled());
-        read_buf.clear();
-        Poll::Ready(Ok(()))
-    }
-    fn poll_connected2(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
-        let mut read_buf = to_read_buf(&mut self.write_buf);
-        let me = &mut *self;
-        let io_src = me.remote.as_mut().unwrap();
-        let mut io_dst = &mut me.io;
-
-        if read_buf.filled().is_empty() {
-            if let Err(err) = ready!(Pin::new(io_src).poll_read(cx, &mut read_buf)) {
-                return Poll::Ready(Err(Error::IoError(err)));
-            }
-            trace!("io dst: poll read: {:?}", &read_buf.filled());
-        }
-
-        if let Err(err) = ready!(Pin::new(&mut io_dst).poll_write(cx, read_buf.filled())) {
-            return Poll::Ready(Err(Error::IoError(err)));
-        }
-        if let Err(err) = ready!(Pin::new(&mut io_dst).poll_flush(cx)) {
-            return Poll::Ready(Err(Error::IoError(err)));
-        }
-        trace!("io src: poll write: {:?}", &read_buf.filled());
-        read_buf.clear();
-        Poll::Ready(Ok(()))
     }
 }
 

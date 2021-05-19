@@ -6,6 +6,7 @@ use std::{
 use crate::{error::Error, Result};
 use futures::ready;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tracing::trace;
 pub struct Proxy<'a, I, O> {
     src: &'a mut I,
     dst: &'a mut O,
@@ -26,14 +27,23 @@ where
             if let Err(err) = ready!(Pin::new(&mut *me.src).poll_read(cx, buf)) {
                 return Poll::Ready(Err(Error::IoError(err)));
             }
+            trace!("Read: {:?} bytes", buf.filled().len());
+            if buf.filled().is_empty() {
+                return Poll::Ready(Err(Error::ConnectionClose));
+            }
         }
-        if let Err(err) = ready!(Pin::new(&mut *me.dst).poll_write(cx, buf.filled())) {
-            return Poll::Ready(Err(Error::IoError(err)));
+        match ready!(Pin::new(&mut *me.dst).poll_write(cx, buf.filled())) {
+            Ok(n) => {
+                trace!("Write {:?} bytes, remain: {:?}", n, buf.remaining());
+                if n == 0 {
+                    return Poll::Ready(Err(Error::ConnectionClose));
+                }
+            }
+            Err(err) => return Poll::Ready(Err(Error::IoError(err))),
         }
         if let Err(err) = ready!(Pin::new(&mut *me.dst).poll_flush(cx)) {
             return Poll::Ready(Err(Error::IoError(err)));
         }
-        buf.clear();
         Poll::Ready(Ok(()))
     }
 }
