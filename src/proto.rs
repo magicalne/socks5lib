@@ -1,4 +1,8 @@
-use std::{fmt::Debug, net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6}, usize};
+use std::{
+    fmt::Debug,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
+    usize,
+};
 
 use bytes::BufMut;
 use tracing::trace;
@@ -96,9 +100,7 @@ pub enum Addr {
 impl Debug for Addr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Addr::SocketAddr(addr) => {
-                f.write_fmt(format_args!("SocksetAddr: {}", addr))
-            }
+            Addr::SocketAddr(addr) => f.write_fmt(format_args!("SocksetAddr: {}", addr)),
             Addr::DomainName(buf, port) => {
                 let domain = String::from_utf8_lossy(buf);
                 f.write_fmt(format_args!("domain: {}:{}", domain, port))
@@ -147,7 +149,11 @@ impl Addr {
                 3 => {
                     let size = buf.get(1).map(|l| -> usize { *l as usize });
                     if let Some(size) = size {
-                        trace!("buf:[2+size]: {}, buf:[3+size]: {}", buf[2+size], buf[3+size]);
+                        trace!(
+                            "buf:[2+size]: {}, buf:[3+size]: {}",
+                            buf[2 + size],
+                            buf[3 + size]
+                        );
                         let port = (buf[2 + size] as u16) << 8 | (buf[3 + size] as u16);
                         Some(Self::DomainName(Vec::from(&buf[2..(2 + size)]), port))
                     } else {
@@ -265,12 +271,17 @@ impl Decoder {
 pub struct Encoder;
 
 impl Encoder {
-    pub fn encode_method_select_msg(ver: Version, method: &Method, buf: &mut impl BufMut) {
+    pub fn encode_method_select_msg<B: BufMut>(ver: Version, method: &Method, buf: &mut B) {
         buf.put_u8(ver.get_u8());
         buf.put_u8(method.get_u8());
     }
 
-    pub fn encode_server_reply(ver: &Version, rep: &Reply, addr: &Addr, mut buf: &mut impl BufMut) {
+    pub fn encode_server_reply<B: BufMut>(
+        ver: &Version,
+        rep: &Reply,
+        addr: &Addr,
+        mut buf: &mut B,
+    ) {
         buf.put_u8(ver.get_u8());
         buf.put_u8(rep.encode());
         buf.put_u8(0x00); //reserved

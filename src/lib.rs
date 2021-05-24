@@ -1,7 +1,7 @@
-use std::{future::Future, io, mem::MaybeUninit, pin::Pin};
+use std::{io, mem::MaybeUninit};
 
 use bytes::BufMut;
-use futures::{FutureExt, future::BoxFuture};
+use futures::{future::BoxFuture};
 use proto::Addr;
 use tokio::{io::{AsyncRead, AsyncWrite, ReadBuf}, net::TcpStream};
 
@@ -9,6 +9,7 @@ pub mod error;
 pub mod proto;
 pub mod server;
 pub mod proxy;
+pub mod conn;
 
 pub type Result<T> = std::result::Result<T, crate::error::Error>;
 

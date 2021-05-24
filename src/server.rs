@@ -9,14 +9,14 @@ use crate::{
     proxy::Proxy,
     to_read_buf, Connector, Result,
 };
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BytesMut};
 use futures::{
-    future::{ready, BoxFuture},
+    future::{BoxFuture},
     ready, Future,
 };
 use proto::Reply;
 use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
+    io::{AsyncRead, AsyncWrite},
     net::TcpListener,
 };
 use tracing::{debug, info, trace};
@@ -62,7 +62,7 @@ where
 #[pin_project::pin_project]
 pub struct Conn<IO, R, C> {
     #[pin]
-    io: IO,
+    io: IO, /* FIX io is pending */
     remote: Option<R>,
     #[pin]
     remote_fut: Option<BoxFuture<'static, std::io::Result<R>>>,
@@ -113,6 +113,7 @@ where
                     let _ = ready!(self.poll_remote(cx))?;
                 }
                 State::Connected => {
+                    trace!("Connected...");
                     match ready!(self.poll_connected(cx)) {
                         Ok(_) => {}
                         Err(err) => return Poll::Ready(Err(err)),
