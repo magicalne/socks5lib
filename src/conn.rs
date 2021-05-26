@@ -14,161 +14,146 @@ use tracing::trace;
 use crate::{
     error::Error,
     proto::{Addr, Command, Decoder, Encoder, Reply, Version},
+    proxy::PProxy,
     Connector, Result,
 };
 
-#[pin_project::pin_project(project = ConnectingStateProj)]
-enum ConnectingState<C, O> {
+enum ConnectingState {
     Negotiation,
     SubNegotiation,
-    OpenRemote(#[pin] CommandConnect<C, O>),
+    OpenRemote,
 }
-#[pin_project::pin_project]
 struct Connecting<IO, C, O> {
-    #[pin]
-    io: IO,
+    io: Option<IO>,
     buf: BytesMut,
-    #[pin]
-    o: Option<O>,
-    o_buf: BytesMut,
-    #[pin]
-    state: ConnectingState<C, O>,
+    state: ConnectingState,
     connector: C,
-    phantom_data: PhantomData<O>,
+    connector_fut: Option<BoxFuture<'static, io::Result<O>>>,
+    ver: Option<Version>,
+    addr: Option<Addr>,
 }
 
-impl<IO, C, O> Connecting<IO, C, O> {
+impl<IO, C, O> Unpin for Connecting<IO, C, O> {}
+
+impl<IO, C, O> Connecting<IO, C, O>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+    C: Connector<Connection = O>,
+    O: AsyncRead + AsyncWrite + Unpin,
+{
     fn new(io: IO, connector: C) -> Self {
-        let buf = BytesMut::with_capacity(1024 * 8);
-        let o_buf = BytesMut::with_capacity(1024 * 8);
+        let buf = BytesMut::new();
         Self {
-            io,
+            io: Some(io),
             buf,
-            o: None,
-            o_buf,
             state: ConnectingState::Negotiation,
             connector,
-            phantom_data: PhantomData,
+            connector_fut: None,
+            ver: None,
+            addr: None,
         }
     }
-}
 
-impl<IO, C, O> AsyncRead for Connecting<IO, C, O>
-where
-    IO: AsyncRead + AsyncWrite + Unpin,
-    C: Connector<Connection = O>,
-    O: AsyncRead + AsyncWrite + Unpin,
-{
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        self.project().io.poll_read(cx, buf)
-    }
-}
-
-impl<IO, C, O> AsyncWrite for Connecting<IO, C, O>
-where
-    IO: AsyncRead + AsyncWrite + Unpin,
-    C: Connector<Connection = O>,
-    O: AsyncRead + AsyncWrite + Unpin,
-{
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        self.project().io.poll_write(cx, buf)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.project().io.poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.project().io.poll_shutdown(cx)
-    }
-}
-
-impl<IO, C, O> Future for Connecting<IO, C, O>
-where
-    IO: AsyncRead + AsyncWrite + Unpin,
-    C: Connector<Connection = O>,
-    O: AsyncRead + AsyncWrite + Unpin,
-{
-    type Output = Result<O>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut me = self.project();
+    fn poll_inner(&mut self, cx: &mut Context<'_>) -> Poll<Result<(IO, O)>> {
+        let me = &mut *self;
         loop {
-            match me.state.as_mut().project() {
-                ConnectingStateProj::Negotiation => {
-                    trace!("negotiation...");
-                    me.buf.clear();
-                    let n = ready!(poll_read_buf(me.io.as_mut(), cx, me.buf))?;
-                    if n == 0 {
-                        return Poll::Ready(Err(Error::ConnectionClose));
-                    }
-                    let buf = me.buf.chunk();
-                    let (ver, methods) = Decoder::parse_connecting(buf)?;
-                    let m = methods.first().unwrap();
-                    me.buf.clear();
-                    Encoder::encode_method_select_msg(ver, m, me.buf);
-                    trace!("poll negotiation writing: {:?}", me.buf);
-                    let n = ready!(poll_write_buf(me.io.as_mut(), cx, me.buf))?;
-                    if n == 0 {
-                        return Poll::Ready(Err(Error::ConnectionClose));
-                    }
-                    ready!(me.io.as_mut().poll_flush(cx))?;
-                    me.state.set(ConnectingState::SubNegotiation);
+            match &mut me.state {
+                ConnectingState::Negotiation => {
+                    let _ = ready!(me.poll_negotiation(cx))?;
                 }
-                ConnectingStateProj::SubNegotiation => {
-                    trace!("sub negotiation...");
-                    me.buf.clear();
-                    let n = ready!(poll_read_buf(me.io.as_mut(), cx, me.buf))?;
-                    if n == 0 {
-                        return Poll::Ready(Err(Error::ConnectionClose));
-                    }
-                    let buf = me.buf.chunk();
-                    let (ver, cmd, addr) = Decoder::parse_nego_req(buf)?;
-                    match cmd {
-                        Command::Connect => {
-                            let cmd_connect = CommandConnect {
-                                ver,
-                                addr,
-                                remote_fut: None,
-                                connector: me.connector.clone(),
-                                phantom: *me.phantom_data,
-                            };
-                            me.state.set(ConnectingState::OpenRemote(cmd_connect));
-                        }
-                        Command::Bind => {
-                            unimplemented!()
-                        }
-                        Command::UdpAssociate => {
-                            unimplemented!()
-                        }
-                    };
+                ConnectingState::SubNegotiation => {
+                    let _ = ready!(me.poll_subnegotiation(cx))?;
                 }
-                ConnectingStateProj::OpenRemote(connect) => {
-                    let ver = connect.ver.clone();
-                    let addr = connect.addr.clone();
-                    let remote_io = ready!(connect.poll(cx))?;
-                    // me.o.set(Some(remote_io));
-                    trace!("Remote connected.");
-                    me.buf.clear();
-                    Encoder::encode_server_reply(&ver, &Reply::Succeeded, &addr, me.buf);
-                    let n = ready!(poll_write_buf(me.io.as_mut(), cx, me.buf))?;
-                    if n == 0 {
-                        return Poll::Ready(Err(Error::ConnectionClose));
-                    }
-                    let _ = ready!(me.io.as_mut().poll_flush(cx))?;
-                    return Poll::Ready(Ok(remote_io));
-                    // me.state.set(ConnectingState::Proxy);
+                ConnectingState::OpenRemote => {
+                    let remote = ready!(me.poll_open_remote(cx))?;
+                    let source = me.io.take().unwrap();
+                    return Poll::Ready(Ok((source, remote)));
                 }
             }
         }
+    }
+
+    fn poll_negotiation(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        trace!("negotiation...");
+        self.buf.clear();
+        let n = ready!(poll_read_buf(
+            Pin::new(self.io.as_mut().unwrap()),
+            cx,
+            &mut self.buf
+        ))?;
+        if n == 0 {
+            return Poll::Ready(Err(Error::ConnectionClose));
+        }
+        let buf = self.buf.chunk();
+        let (ver, methods) = Decoder::parse_connecting(buf)?;
+        let m = methods.first().unwrap();
+        self.buf.clear();
+        Encoder::encode_method_select_msg(ver, m, &mut self.buf);
+        trace!("poll negotiation writing: {:?}", self.buf);
+        let n = ready!(poll_write_buf(
+            Pin::new(self.io.as_mut().unwrap()),
+            cx,
+            &mut self.buf
+        ))?;
+        if n == 0 {
+            return Poll::Ready(Err(Error::ConnectionClose));
+        }
+        ready!(Pin::new(self.io.as_mut().unwrap()).poll_flush(cx))?;
+        self.state = ConnectingState::SubNegotiation;
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_subnegotiation(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        trace!("sub negotiation...");
+        self.buf.clear();
+        let n = ready!(poll_read_buf(
+            Pin::new(self.io.as_mut().unwrap()),
+            cx,
+            &mut self.buf
+        ))?;
+        if n == 0 {
+            return Poll::Ready(Err(Error::ConnectionClose));
+        }
+        let buf = self.buf.chunk();
+        let (ver, cmd, addr) = Decoder::parse_nego_req(buf)?;
+        match cmd {
+            Command::Connect => {
+                self.state = ConnectingState::OpenRemote;
+                self.ver = Some(ver);
+                self.addr = Some(addr);
+            }
+            Command::Bind => {
+                unimplemented!()
+            }
+            Command::UdpAssociate => {
+                unimplemented!()
+            }
+        };
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_open_remote(&mut self, cx: &mut Context<'_>) -> Poll<Result<O>> {
+        if self.connector_fut.is_none() {
+            let addr = self.addr.clone().unwrap();
+            self.connector_fut = Some(self.connector.connect(addr));
+        }
+        let fut = self.connector_fut.as_mut().unwrap();
+        let remote_io = ready!(fut.as_mut().poll(cx))?;
+        trace!("Remote connected.");
+        self.buf.clear();
+        let ver = self.ver.as_ref().unwrap();
+        let addr = self.addr.as_ref().unwrap();
+        Encoder::encode_server_reply(ver, &Reply::Succeeded, addr, &mut self.buf);
+        let n = ready!(poll_write_buf(
+            Pin::new(self.io.as_mut().unwrap()),
+            cx,
+            &mut self.buf
+        ))?;
+        if n == 0 {
+            return Poll::Ready(Err(Error::ConnectionClose));
+        }
+        let _ = ready!(Pin::new(self.io.as_mut().unwrap()).poll_flush(cx))?;
+        Poll::Ready(Ok(remote_io))
     }
 }
 
@@ -198,3 +183,57 @@ where
         Poll::Ready(Ok(remote_io))
     }
 }
+
+#[pin_project::pin_project(project = ConnStateProj)]
+enum ConnState<IO, C, O> {
+    Connecting(Connecting<IO, C, O>),
+    Connected(PProxy<IO, O>),
+}
+
+#[pin_project::pin_project]
+pub struct Connection<IO, C, O> {
+    #[pin]
+    state: ConnState<IO, C, O>,
+}
+
+impl<IO, C, O> Connection<IO, C, O>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+    C: Connector<Connection = O>,
+    O: AsyncRead + AsyncWrite + Unpin,
+{
+    pub fn new(io: IO, connector: C) -> Self {
+        let connecting = Connecting::new(io, connector);
+        Self {
+            state: ConnState::Connecting(connecting),
+        }
+    }
+}
+
+impl<IO, C, O> Future for Connection<IO, C, O>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+    C: Connector<Connection = O>,
+    O: AsyncRead + AsyncWrite + Unpin,
+{
+    type Output = Result<()>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut me = self.project();
+        loop {
+            match me.state.as_mut().project() {
+                ConnStateProj::Connecting(connecting) => {
+                    let (i, o) = ready!(connecting.poll_inner(cx))?;
+                    let proxy = PProxy::new(i, o);
+                    me.state.set(ConnState::Connected(proxy));
+                }
+                ConnStateProj::Connected(mut proxy) => {
+                    ready!(Pin::new(&mut proxy).poll(cx))?;
+                    return Poll::Ready(Ok(()))
+                }
+            }
+        }
+    }
+}
+
+unsafe impl<IO, C, O> Send for Connection<IO, C, O> {}
