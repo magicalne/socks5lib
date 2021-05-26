@@ -1,6 +1,11 @@
-use std::{io, marker::PhantomData, pin::Pin, task::{Context, Poll}, u16};
+use std::{
+    io,
+    marker::PhantomData,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BytesMut};
 use futures::{future::BoxFuture, ready, Future};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::io::{poll_read_buf, poll_write_buf};
@@ -8,49 +13,97 @@ use tracing::trace;
 
 use crate::{
     error::Error,
-    proto::{Addr, Decoder, Encoder, Version},
+    proto::{Addr, Command, Decoder, Encoder, Reply, Version},
     Connector, Result,
 };
 
-enum ConnectingState {
+#[pin_project::pin_project(project = ConnectingStateProj)]
+enum ConnectingState<C, O> {
     Negotiation,
     SubNegotiation,
-    OpenRemote,
+    OpenRemote(#[pin] CommandConnect<C, O>),
 }
 #[pin_project::pin_project]
-struct Connecting<IO, C> {
+struct Connecting<IO, C, O> {
     #[pin]
     io: IO,
     buf: BytesMut,
-    state: ConnectingState,
-    _phantom: PhantomData<C>
+    #[pin]
+    o: Option<O>,
+    o_buf: BytesMut,
+    #[pin]
+    state: ConnectingState<C, O>,
+    connector: C,
+    phantom_data: PhantomData<O>,
 }
 
-impl<IO, C> Connecting<IO, C> {
+impl<IO, C, O> Connecting<IO, C, O> {
     fn new(io: IO, connector: C) -> Self {
-        let buf = BytesMut::with_capacity(1024);
+        let buf = BytesMut::with_capacity(1024 * 8);
+        let o_buf = BytesMut::with_capacity(1024 * 8);
         Self {
             io,
             buf,
+            o: None,
+            o_buf,
             state: ConnectingState::Negotiation,
-            _phantom: PhantomData
+            connector,
+            phantom_data: PhantomData,
         }
     }
 }
 
-impl<IO, C, O> Future for Connecting<IO, C>
+impl<IO, C, O> AsyncRead for Connecting<IO, C, O>
 where
     IO: AsyncRead + AsyncWrite + Unpin,
     C: Connector<Connection = O>,
     O: AsyncRead + AsyncWrite + Unpin,
 {
-    type Output = Result<()>;
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        self.project().io.poll_read(cx, buf)
+    }
+}
+
+impl<IO, C, O> AsyncWrite for Connecting<IO, C, O>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+    C: Connector<Connection = O>,
+    O: AsyncRead + AsyncWrite + Unpin,
+{
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.project().io.poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.project().io.poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.project().io.poll_shutdown(cx)
+    }
+}
+
+impl<IO, C, O> Future for Connecting<IO, C, O>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+    C: Connector<Connection = O>,
+    O: AsyncRead + AsyncWrite + Unpin,
+{
+    type Output = Result<O>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut me = self.project();
         loop {
-            match me.state {
-                ConnectingState::Negotiation => {
+            match me.state.as_mut().project() {
+                ConnectingStateProj::Negotiation => {
                     trace!("negotiation...");
                     me.buf.clear();
                     let n = ready!(poll_read_buf(me.io.as_mut(), cx, me.buf))?;
@@ -68,9 +121,9 @@ where
                         return Poll::Ready(Err(Error::ConnectionClose));
                     }
                     ready!(me.io.as_mut().poll_flush(cx))?;
-                    *me.state = ConnectingState::SubNegotiation;
+                    me.state.set(ConnectingState::SubNegotiation);
                 }
-                ConnectingState::SubNegotiation => {
+                ConnectingStateProj::SubNegotiation => {
                     trace!("sub negotiation...");
                     me.buf.clear();
                     let n = ready!(poll_read_buf(me.io.as_mut(), cx, me.buf))?;
@@ -79,8 +132,41 @@ where
                     }
                     let buf = me.buf.chunk();
                     let (ver, cmd, addr) = Decoder::parse_nego_req(buf)?;
+                    match cmd {
+                        Command::Connect => {
+                            let cmd_connect = CommandConnect {
+                                ver,
+                                addr,
+                                remote_fut: None,
+                                connector: me.connector.clone(),
+                                phantom: *me.phantom_data,
+                            };
+                            me.state.set(ConnectingState::OpenRemote(cmd_connect));
+                        }
+                        Command::Bind => {
+                            unimplemented!()
+                        }
+                        Command::UdpAssociate => {
+                            unimplemented!()
+                        }
+                    };
                 }
-                ConnectingState::OpenRemote => {}
+                ConnectingStateProj::OpenRemote(connect) => {
+                    let ver = connect.ver.clone();
+                    let addr = connect.addr.clone();
+                    let remote_io = ready!(connect.poll(cx))?;
+                    // me.o.set(Some(remote_io));
+                    trace!("Remote connected.");
+                    me.buf.clear();
+                    Encoder::encode_server_reply(&ver, &Reply::Succeeded, &addr, me.buf);
+                    let n = ready!(poll_write_buf(me.io.as_mut(), cx, me.buf))?;
+                    if n == 0 {
+                        return Poll::Ready(Err(Error::ConnectionClose));
+                    }
+                    let _ = ready!(me.io.as_mut().poll_flush(cx))?;
+                    return Poll::Ready(Ok(remote_io));
+                    // me.state.set(ConnectingState::Proxy);
+                }
             }
         }
     }
@@ -93,6 +179,7 @@ struct CommandConnect<C, O> {
     #[pin]
     remote_fut: Option<BoxFuture<'static, io::Result<O>>>,
     connector: C,
+    phantom: PhantomData<O>,
 }
 
 impl<C, O> Future for CommandConnect<C, O>
@@ -104,12 +191,10 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut me = self.project();
-        loop {
-            if me.remote_fut.is_none() {
-                *me.remote_fut = Some(me.connector.connect(me.addr.clone()));
-            }
-            //TODO
-            // let remote_io = ready!(me.remote_fut.as_pin_mut().unwrap().poll(cx))?;
+        if me.remote_fut.is_none() {
+            *me.remote_fut = Some(me.connector.connect(me.addr.clone()));
         }
+        let remote_io = ready!(me.remote_fut.as_pin_mut().unwrap().poll(cx))?;
+        Poll::Ready(Ok(remote_io))
     }
 }
