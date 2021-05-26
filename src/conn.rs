@@ -14,7 +14,7 @@ use tracing::trace;
 use crate::{
     error::Error,
     proto::{Addr, Command, Decoder, Encoder, Reply, Version},
-    proxy::PProxy,
+    proxy::Proxy,
     Connector, Result,
 };
 
@@ -187,7 +187,7 @@ where
 #[pin_project::pin_project(project = ConnStateProj)]
 enum ConnState<IO, C, O> {
     Connecting(Connecting<IO, C, O>),
-    Connected(PProxy<IO, O>),
+    Connected(Proxy<IO, O>),
 }
 
 #[pin_project::pin_project]
@@ -224,7 +224,7 @@ where
             match me.state.as_mut().project() {
                 ConnStateProj::Connecting(connecting) => {
                     let (i, o) = ready!(connecting.poll_inner(cx))?;
-                    let proxy = PProxy::new(i, o);
+                    let proxy = Proxy::new(i, o);
                     me.state.set(ConnState::Connected(proxy));
                 }
                 ConnStateProj::Connected(mut proxy) => {
@@ -236,4 +236,5 @@ where
     }
 }
 
+/// Safety: Connection is not cloneable and shared nothing.
 unsafe impl<IO, C, O> Send for Connection<IO, C, O> {}

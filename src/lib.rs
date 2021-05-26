@@ -15,7 +15,6 @@ pub type Result<T> = std::result::Result<T, crate::error::Error>;
 
 pub trait Connector: Clone {
     type Connection: AsyncRead + AsyncWrite + Unpin;
-    // type Future: Future<Output = io::Result<Self::Connection>> + Send + Unpin;
 
     fn connect(&mut self, a: Addr) -> BoxFuture<'static, io::Result<Self::Connection>>;
 }
@@ -26,7 +25,6 @@ pub struct LocalConnector;
 impl Connector for LocalConnector {
     type Connection = TcpStream;
 
-    // type Future = Pin<Box<dyn Future<Output = io::Result<Self::Connection>> + Send>>;
 
     fn connect(&mut self, a: Addr) -> BoxFuture<'static, io::Result<Self::Connection>> {
         match a {

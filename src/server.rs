@@ -1,4 +1,4 @@
-use crate::{Connector, Result};
+use crate::{Connector, Result, conn::Connection};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::TcpListener,
@@ -31,9 +31,7 @@ where
         while let Ok((stream, addr)) = self.listener.accept().await {
             trace!("Accept addr: {:?}", addr);
             let connector = self.connector.clone();
-            let connection = crate::conn::Connection::new(stream, connector);
-            // let conn = Conn::new(stream, connector);
-            // let connection = Connection::new(conn);
+            let connection = Connection::new(stream, connector);
             tokio::spawn(async move {
                 if let Err(err) = connection.await {
                     debug!("Connection error: {:?}", err);
