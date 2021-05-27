@@ -1,9 +1,7 @@
-use std::{
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
-use futures::{Future, future::BoxFuture};
-use lib::{proto::Addr, server::Server, Connector, LocalConnector, Result};
+use futures::{future::BoxFuture, Future};
+use socks5lib::{proto::Addr, server::Server, Connector, LocalConnector, Result};
 use tokio::net::TcpStream;
 use tracing::Level;
 
@@ -29,7 +27,7 @@ pub async fn local_connector_test() -> Result<()> {
     )));
     let stream = connector.connect(addr);
 
-    let mut my_fut = MyFut {fut: None};
+    let mut my_fut = MyFut { fut: None };
     let stream = my_fut.await?;
     Ok(())
 }
