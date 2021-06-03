@@ -77,7 +77,7 @@ where
 {
     fn new(io: I, direction: &'static str) -> Self {
         Self {
-            buf: BytesMut::new(),
+            buf: BytesMut::with_capacity(8196),
             is_shutdown: false,
             io,
             direction,
