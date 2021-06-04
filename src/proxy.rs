@@ -76,8 +76,10 @@ where
     I: AsyncRead + Unpin,
 {
     fn new(io: I, direction: &'static str) -> Self {
+        let buf = vec![0u8; 81960];
+        let buf = BytesMut::from(&buf[..]);
         Self {
-            buf: BytesMut::with_capacity(81960),
+            buf,
             is_shutdown: false,
             io,
             direction,
